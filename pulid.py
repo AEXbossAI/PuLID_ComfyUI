@@ -18,10 +18,14 @@ from .encoders import IDEncoder
 INSIGHTFACE_DIR = os.path.join(folder_paths.models_dir, "insightface")
 
 MODELS_DIR = os.path.join(folder_paths.models_dir, "pulid")
+os.makedirs(MODELS_DIR, exist_ok=True)
 if "pulid" not in folder_paths.folder_names_and_paths:
-    current_paths = [MODELS_DIR]
-else:
-    current_paths, _ = folder_paths.folder_names_and_paths["pulid"]
+    folder_paths.folder_names_and_paths["pulid"] = ([MODELS_DIR], set())
+current_paths, _ = folder_paths.folder_names_and_paths["pulid"]
+checkpoints_dir = folder_paths.folder_names_and_paths["checkpoints"][0]
+for cp in checkpoints_dir:
+    if cp not in current_paths:
+        current_paths.append(cp)
 folder_paths.folder_names_and_paths["pulid"] = (current_paths, folder_paths.supported_pt_extensions)
 
 class PulidModel(nn.Module):
