@@ -247,31 +247,42 @@ class PulidInsightFaceLoader:
         return (model,)
 
 class PulidEvaClipLoader:
+    class PulidEvaClipLoader:
     @classmethod
     def INPUT_TYPES(s):
-        return {
-            "required": {},
-        }
+        clip_files = folder_paths.get_filename_list("clip_vision")
+        eva_files = [f for f in clip_files if "EVA" in f or "eva" in f.lower()]
+        return {"required": {
+            "model": (["auto"] + eva_files,),
+        }}
 
     RETURN_TYPES = ("EVA_CLIP",)
     FUNCTION = "load_eva_clip"
     CATEGORY = "pulid"
 
-    def load_eva_clip(self):
+    def load_eva_clip(self, model="auto"):
         from .eva_clip.factory import create_model_and_transforms
 
-        model, _, _ = create_model_and_transforms('EVA02-CLIP-L-14-336', 'eva_clip', force_custom_clip=True)
+        pretrained = "eva_clip"
+        if model != "auto":
+            for search_path in folder_paths.get_folder_paths("clip_vision"):
+                candidate = os.path.join(search_path, model)
+                if os.path.exists(candidate):
+                    pretrained = candidate
+                    break
 
-        model = model.visual
+        model_obj, _, _ = create_model_and_transforms('EVA02-CLIP-L-14-336', pretrained, force_custom_clip=True)
 
-        eva_transform_mean = getattr(model, 'image_mean', OPENAI_DATASET_MEAN)
-        eva_transform_std = getattr(model, 'image_std', OPENAI_DATASET_STD)
+        model_obj = model_obj.visual
+
+        eva_transform_mean = getattr(model_obj, 'image_mean', OPENAI_DATASET_MEAN)
+        eva_transform_std = getattr(model_obj, 'image_std', OPENAI_DATASET_STD)
         if not isinstance(eva_transform_mean, (list, tuple)):
-            model["image_mean"] = (eva_transform_mean,) * 3
+            model_obj.image_mean = (eva_transform_mean,) * 3
         if not isinstance(eva_transform_std, (list, tuple)):
-            model["image_std"] = (eva_transform_std,) * 3
+            model_obj.image_std = (eva_transform_std,) * 3
 
-        return (model,)
+        return (model_obj,)
 
 
 class ApplyPulid:
@@ -498,7 +509,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PulidModelLoader": "Load PuLID Model",
     "PulidInsightFaceLoader": "Load InsightFace (PuLID)",
-    "PulidEvaClipLoader": "Load Eva Clip (PuLID)",
+    "": "Load Eva Clip (PuLID)",
     "ApplyPulid": "Apply PuLID",
     "ApplyPulidAdvanced": "Apply PuLID Advanced",
 }
