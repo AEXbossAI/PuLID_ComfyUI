@@ -6,9 +6,14 @@ import os
 import math
 import folder_paths
 import comfy.utils
+import comfy.model_management
 from insightface.app import FaceAnalysis
-from facexlib.parsing import init_parsing_model
-from facexlib.utils.face_restoration_helper import FaceRestoreHelper
+try:
+    from facexlib.parsing import init_parsing_model
+    from facexlib.utils.face_restoration_helper import FaceRestoreHelper
+    FACEXLIB_AVAILABLE = True
+except ImportError:
+    FACEXLIB_AVAILABLE = False
 from comfy.ldm.modules.attention import optimized_attention
 
 from .eva_clip.constants import OPENAI_DATASET_MEAN, OPENAI_DATASET_STD
@@ -129,12 +134,6 @@ def pulid_attention(out, q, k, v, extra_options, module_key='', pulid=None, cond
     batch_prompt = b // len(cond_or_uncond)
     _, _, oh, ow = extra_options["original_shape"]
 
-    #conds = torch.cat([uncond.repeat(batch_prompt, 1, 1), cond.repeat(batch_prompt, 1, 1)], dim=0)
-    #zero_tensor = torch.zeros((conds.size(0), num_zero, conds.size(-1)), dtype=conds.dtype, device=conds.device)
-    #conds = torch.cat([conds, zero_tensor], dim=1)
-    #ip_k = pulid.ip_layers.to_kvs[k_key](conds)
-    #ip_v = pulid.ip_layers.to_kvs[v_key](conds)
-    
     k_cond = pulid.ip_layers.to_kvs[k_key](cond).repeat(batch_prompt, 1, 1)
     k_uncond = pulid.ip_layers.to_kvs[k_key](uncond).repeat(batch_prompt, 1, 1)
     v_cond = pulid.ip_layers.to_kvs[v_key](cond).repeat(batch_prompt, 1, 1)
@@ -173,7 +172,6 @@ def pulid_attention(out, q, k, v, extra_options, module_key='', pulid=None, cond
         mask = mask.repeat(len(cond_or_uncond), 1, 1)
         mask = mask.view(mask.shape[0], -1, 1).repeat(1, 1, out.shape[2])
 
-        # covers cases where extreme aspect ratios can cause the mask to have a wrong size
         mask_len = mask_h * mask_w
         if mask_len < seq_len:
             pad_len = seq_len - mask_len
@@ -222,7 +220,6 @@ class PulidModelLoader:
                     st_model["ip_adapter"][key.replace("ip_adapter.", "")] = model[key]
             model = st_model
         
-        # Also initialize the model, takes longer to load but then it doesn't have to be done every time you change parameters in the apply node
         model = PulidModel(model)
 
         return (model,)
@@ -241,13 +238,12 @@ class PulidInsightFaceLoader:
     CATEGORY = "pulid"
 
     def load_insightface(self, provider):
-        model = FaceAnalysis(name="antelopev2", root=INSIGHTFACE_DIR, providers=[provider + 'ExecutionProvider',]) # alternative to buffalo_l
+        model = FaceAnalysis(name="antelopev2", root=INSIGHTFACE_DIR, providers=[provider + 'ExecutionProvider',])
         model.prepare(ctx_id=0, det_size=(640, 640))
 
         return (model,)
 
 class PulidEvaClipLoader:
-    class PulidEvaClipLoader:
     @classmethod
     def INPUT_TYPES(s):
         clip_files = folder_paths.get_filename_list("clip_vision")
@@ -265,11 +261,16 @@ class PulidEvaClipLoader:
 
         pretrained = "eva_clip"
         if model != "auto":
-            for search_path in folder_paths.get_folder_paths("clip_vision"):
-                candidate = os.path.join(search_path, model)
-                if os.path.exists(candidate):
-                    pretrained = candidate
-                    break
+            # Check /tmp/eva_clip/ first (safe location outside ComfyUI models scan)
+            tmp_path = os.path.join("/tmp/eva_clip", model)
+            if os.path.exists(tmp_path):
+                pretrained = tmp_path
+            else:
+                for search_path in folder_paths.get_folder_paths("clip_vision"):
+                    candidate = os.path.join(search_path, model)
+                    if os.path.exists(candidate):
+                        pretrained = candidate
+                        break
 
         model_obj, _, _ = create_model_and_transforms('EVA02-CLIP-L-14-336', pretrained, force_custom_clip=True)
 
@@ -310,6 +311,9 @@ class ApplyPulid:
     CATEGORY = "pulid"
 
     def apply_pulid(self, model, pulid, eva_clip, face_analysis, image, weight, start_at, end_at, method=None, noise=0.0, fidelity=None, projection=None, attn_mask=None):
+        if not FACEXLIB_AVAILABLE:
+            raise RuntimeError("PuLID requires facexlib. Install it with: pip install facexlib")
+
         work_model = model.clone()
         
         device = comfy.model_management.get_torch_device()
@@ -343,7 +347,6 @@ class ApplyPulid:
         if fidelity is not None:
             num_zero = fidelity
 
-        #face_analysis.det_model.input_size = (640,640)
         image = tensor_to_image(image)
 
         face_helper = FaceRestoreHelper(
@@ -363,7 +366,6 @@ class ApplyPulid:
         uncond = []
 
         for i in range(image.shape[0]):
-            # get insightface embeddings
             iface_embeds = None
             for size in [(size, size) for size in range(640, 256, -64)]:
                 face_analysis.det_model.input_size = size
@@ -373,18 +375,15 @@ class ApplyPulid:
                     iface_embeds = torch.from_numpy(face.embedding).unsqueeze(0).to(device, dtype=dtype)
                     break
             else:
-                # No face detected, skip this image
                 print('Warning: No face detected in image', i)
                 continue
 
-            # get eva_clip embeddings
             face_helper.clean_all()
             face_helper.read_image(image[i])
             face_helper.get_face_landmarks_5(only_center_face=True)
             face_helper.align_warp_face()
 
             if len(face_helper.cropped_faces) == 0:
-                # No face detected, skip this image
                 continue
             
             face = face_helper.cropped_faces[0]
@@ -394,7 +393,6 @@ class ApplyPulid:
             bg = sum(parsing_out == i for i in bg_label).bool()
             white_image = torch.ones_like(face)
             face_features_image = torch.where(bg, white_image, to_gray(face))
-            # apparently MPS only supports NEAREST interpolation?
             face_features_image = T.functional.resize(face_features_image, eva_clip.image_size, T.InterpolationMode.BICUBIC if 'cuda' in device.type else T.InterpolationMode.NEAREST).to(device, dtype=dtype)
             face_features_image = T.functional.normalize(face_features_image, eva_clip.image_mean, eva_clip.image_std)
             
@@ -405,7 +403,6 @@ class ApplyPulid:
 
             id_cond_vit = torch.div(id_cond_vit, torch.norm(id_cond_vit, 2, 1, True))
 
-            # combine embeddings
             id_cond = torch.cat([iface_embeds, id_cond_vit], dim=-1)
             if noise == 0:
                 id_uncond = torch.zeros_like(id_cond)
@@ -422,11 +419,9 @@ class ApplyPulid:
             uncond.append(pulid_model.get_image_embeds(id_uncond, id_vit_hidden_uncond))
 
         if not cond:
-            # No faces detected, return the original model
             print("pulid warning: No faces detected in any of the given images, returning unmodified model.")
             return (work_model,)
         
-        # average embeddings
         cond = torch.cat(cond).to(device, dtype=dtype)
         uncond = torch.cat(uncond).to(device, dtype=dtype)
         if cond.shape[0] > 1:
@@ -457,14 +452,14 @@ class ApplyPulid:
         }
 
         number = 0
-        for id in [4,5,7,8]: # id of input_blocks that have cross attention
-            block_indices = range(2) if id in [4, 5] else range(10) # transformer_depth
+        for id in [4,5,7,8]:
+            block_indices = range(2) if id in [4, 5] else range(10)
             for index in block_indices:
                 patch_kwargs["module_key"] = str(number*2+1)
                 set_model_patch_replace(work_model, patch_kwargs, ("input", id, index))
                 number += 1
-        for id in range(6): # id of output_blocks that have cross attention
-            block_indices = range(2) if id in [3, 4, 5] else range(10) # transformer_depth
+        for id in range(6):
+            block_indices = range(2) if id in [3, 4, 5] else range(10)
             for index in block_indices:
                 patch_kwargs["module_key"] = str(number*2+1)
                 set_model_patch_replace(work_model, patch_kwargs, ("output", id, index))
@@ -509,7 +504,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PulidModelLoader": "Load PuLID Model",
     "PulidInsightFaceLoader": "Load InsightFace (PuLID)",
-    "": "Load Eva Clip (PuLID)",
+    "PulidEvaClipLoader": "Load Eva Clip (PuLID)",
     "ApplyPulid": "Apply PuLID",
     "ApplyPulidAdvanced": "Apply PuLID Advanced",
 }
