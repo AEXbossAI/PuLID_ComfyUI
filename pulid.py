@@ -248,6 +248,12 @@ class PulidEvaClipLoader:
     def INPUT_TYPES(s):
         clip_files = folder_paths.get_filename_list("clip_vision")
         eva_files = [f for f in clip_files if "EVA" in f or "eva" in f.lower()]
+        # Also list files from /tmp/eva_clip/ (safe location outside ComfyUI scan tree)
+        tmp_eva_dir = "/tmp/eva_clip"
+        if os.path.isdir(tmp_eva_dir):
+            for f in os.listdir(tmp_eva_dir):
+                if ("EVA" in f or "eva" in f.lower()) and f not in eva_files:
+                    eva_files.append(f)
         return {"required": {
             "model": (["auto"] + eva_files,),
         }}
@@ -260,9 +266,17 @@ class PulidEvaClipLoader:
         from .eva_clip.factory import create_model_and_transforms
 
         pretrained = "eva_clip"
-        if model != "auto":
-            # Check /tmp/eva_clip/ first (safe location outside ComfyUI models scan)
-            tmp_path = os.path.join("/tmp/eva_clip", model)
+        tmp_eva_dir = "/tmp/eva_clip"
+        if model == "auto":
+            # Check /tmp/eva_clip/ for any cached EVA file before attempting download
+            if os.path.isdir(tmp_eva_dir):
+                for f in sorted(os.listdir(tmp_eva_dir)):
+                    if "EVA" in f or "eva" in f.lower():
+                        pretrained = os.path.join(tmp_eva_dir, f)
+                        break
+        else:
+            # Check /tmp/eva_clip/ first, then clip_vision search paths
+            tmp_path = os.path.join(tmp_eva_dir, model)
             if os.path.exists(tmp_path):
                 pretrained = tmp_path
             else:
