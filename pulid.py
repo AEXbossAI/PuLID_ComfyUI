@@ -266,25 +266,28 @@ class PulidEvaClipLoader:
         from .eva_clip.factory import create_model_and_transforms
 
         pretrained = "eva_clip"
-        tmp_eva_dir = "/tmp/eva_clip"
+        # Search order: /tmp/eva_clip/ → models/pulid/ → /opt/ComfyUI/tmp/eva_clip/ → clip_vision
+        search_dirs = [
+            "/tmp/eva_clip",
+            MODELS_DIR,
+            "/opt/ComfyUI/tmp/eva_clip",
+        ] + folder_paths.get_folder_paths("clip_vision")
+
         if model == "auto":
-            # Check /tmp/eva_clip/ for any cached EVA file before attempting download
-            if os.path.isdir(tmp_eva_dir):
-                for f in sorted(os.listdir(tmp_eva_dir)):
-                    if "EVA" in f or "eva" in f.lower():
-                        pretrained = os.path.join(tmp_eva_dir, f)
-                        break
+            for d in search_dirs:
+                if os.path.isdir(d):
+                    for f in sorted(os.listdir(d)):
+                        if "EVA" in f or "eva" in f.lower():
+                            pretrained = os.path.join(d, f)
+                            break
+                if pretrained != "eva_clip":
+                    break
         else:
-            # Check /tmp/eva_clip/ first, then clip_vision search paths
-            tmp_path = os.path.join(tmp_eva_dir, model)
-            if os.path.exists(tmp_path):
-                pretrained = tmp_path
-            else:
-                for search_path in folder_paths.get_folder_paths("clip_vision"):
-                    candidate = os.path.join(search_path, model)
-                    if os.path.exists(candidate):
-                        pretrained = candidate
-                        break
+            for d in search_dirs:
+                candidate = os.path.join(d, model)
+                if os.path.exists(candidate):
+                    pretrained = candidate
+                    break
 
         model_obj, _, _ = create_model_and_transforms('EVA02-CLIP-L-14-336', pretrained, force_custom_clip=True)
 
