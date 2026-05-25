@@ -4,6 +4,8 @@ import torchvision.transforms as T
 import torch.nn.functional as F
 import os
 import math
+import cv2
+import numpy as np
 import folder_paths
 import comfy.utils
 import comfy.model_management
@@ -24,14 +26,10 @@ INSIGHTFACE_DIR = os.path.join(folder_paths.models_dir, "insightface")
 
 MODELS_DIR = os.path.join(folder_paths.models_dir, "pulid")
 os.makedirs(MODELS_DIR, exist_ok=True)
-if "pulid" not in folder_paths.folder_names_and_paths:
-    folder_paths.folder_names_and_paths["pulid"] = ([MODELS_DIR], set())
-current_paths, _ = folder_paths.folder_names_and_paths["pulid"]
-checkpoints_dir = folder_paths.folder_names_and_paths["checkpoints"][0]
-for cp in checkpoints_dir:
-    if cp not in current_paths:
-        current_paths.append(cp)
-folder_paths.folder_names_and_paths["pulid"] = (current_paths, folder_paths.supported_pt_extensions)
+# Only register .safetensors — prevents ComfyUI from scanning .pt files (EVA-CLIP OOM)
+# Do NOT add checkpoints/ paths (would trigger IPAdapter to load pulid model as checkpoint)
+folder_paths.folder_names_and_paths["pulid"] = ([MODELS_DIR], {'.safetensors'})
+
 
 class PulidModel(nn.Module):
     def __init__(self, model):
@@ -41,7 +39,7 @@ class PulidModel(nn.Module):
         self.image_proj_model = self.init_id_adapter()
         self.image_proj_model.load_state_dict(model["image_proj"])
         self.ip_layers = To_KV(model["ip_adapter"])
-    
+
     def init_id_adapter(self):
         image_proj_model = IDEncoder()
         return image_proj_model
@@ -79,7 +77,7 @@ def tensor_to_size(source, dest_size):
         source = torch.cat((source, source[-1:].repeat(shape)), dim=0)
     elif source_size > dest_size:
         source = source[:dest_size]
-    
+
     return source
 
 def set_model_patch_replace(model, patch_kwargs, key):
@@ -93,7 +91,7 @@ def set_model_patch_replace(model, patch_kwargs, key):
         to["patches_replace"]["attn2"] = {}
     else:
         to["patches_replace"]["attn2"] = to["patches_replace"]["attn2"].copy()
-    
+
     if key not in to["patches_replace"]["attn2"]:
         to["patches_replace"]["attn2"][key] = Attn2Replace(pulid_attention, **patch_kwargs)
         model.model_options["transformer_options"] = to
@@ -104,8 +102,8 @@ class Attn2Replace:
     def __init__(self, callback=None, **kwargs):
         self.callback = [callback]
         self.kwargs = [kwargs]
-    
-    def add(self, callback, **kwargs):          
+
+    def add(self, callback, **kwargs):
         self.callback.append(callback)
         self.kwargs.append(kwargs)
 
@@ -120,7 +118,7 @@ class Attn2Replace:
         for i, callback in enumerate(self.callback):
             if sigma <= self.kwargs[i]["sigma_start"] and sigma >= self.kwargs[i]["sigma_end"]:
                 out = out + callback(out, q, k, v, extra_options, **self.kwargs[i])
-        
+
         return out.to(dtype=dtype)
 
 def pulid_attention(out, q, k, v, extra_options, module_key='', pulid=None, cond=None, uncond=None, weight=1.0, ortho=False, ortho_v2=False, mask=None, **kwargs):
@@ -142,7 +140,7 @@ def pulid_attention(out, q, k, v, extra_options, module_key='', pulid=None, cond
     ip_v = torch.cat([(v_cond, v_uncond)[i] for i in cond_or_uncond], dim=0)
 
     out_ip = optimized_attention(q, ip_k, ip_v, extra_options["n_heads"])
-        
+
     if ortho:
         out = out.to(dtype=torch.float32)
         out_ip = out_ip.to(dtype=torch.float32)
@@ -191,6 +189,31 @@ def to_gray(img):
     x = x.repeat(1, 3, 1, 1)
     return x
 
+# ArcFace 5-point reference landmarks (standard 112x112 space)
+_ARCFACE_DST = np.array([
+    [38.2946, 51.6963],
+    [73.5318, 51.5014],
+    [56.0252, 71.7366],
+    [41.5493, 92.3655],
+    [70.7299, 92.2041],
+], dtype=np.float32)
+
+def _align_face_no_facexlib(image_np, face_obj, size=512):
+    """Align face via InsightFace keypoints — fallback when facexlib unavailable."""
+    kps = face_obj.kps.astype(np.float32)
+    scale = size / 112.0
+    dst = _ARCFACE_DST * scale
+    M, _ = cv2.estimateAffinePartial2D(kps, dst, method=cv2.LMEDS)
+    if M is None:
+        # Fallback: plain bbox crop
+        x1, y1, x2, y2 = map(int, face_obj.bbox)
+        crop = image_np[max(0,y1):y2, max(0,x1):x2]
+        return cv2.resize(crop, (size, size))
+    # image_np is BGR (from tensor_to_image), warpAffine works directly
+    aligned = cv2.warpAffine(image_np, M, (size, size), borderValue=(255, 255, 255))
+    return aligned
+
+
 """
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  Nodes
@@ -219,7 +242,7 @@ class PulidModelLoader:
                 elif key.startswith("ip_adapter."):
                     st_model["ip_adapter"][key.replace("ip_adapter.", "")] = model[key]
             model = st_model
-        
+
         model = PulidModel(model)
 
         return (model,)
@@ -266,7 +289,7 @@ class PulidEvaClipLoader:
         from .eva_clip.factory import create_model_and_transforms
 
         pretrained = "eva_clip"
-        # Search order: /tmp/eva_clip/ → models/pulid/ → /opt/ComfyUI/tmp/eva_clip/ → clip_vision
+        # Search order: /tmp/eva_clip/ → models/pulid/ → clip_vision/
         search_dirs = [
             "/tmp/eva_clip",
             MODELS_DIR,
@@ -290,7 +313,6 @@ class PulidEvaClipLoader:
                     break
 
         model_obj, _, _ = create_model_and_transforms('EVA02-CLIP-L-14-336', pretrained, force_custom_clip=True)
-
         model_obj = model_obj.visual
 
         eva_transform_mean = getattr(model_obj, 'image_mean', OPENAI_DATASET_MEAN)
@@ -328,11 +350,8 @@ class ApplyPulid:
     CATEGORY = "pulid"
 
     def apply_pulid(self, model, pulid, eva_clip, face_analysis, image, weight, start_at, end_at, method=None, noise=0.0, fidelity=None, projection=None, attn_mask=None):
-        if not FACEXLIB_AVAILABLE:
-            raise RuntimeError("PuLID requires facexlib. Install it with: pip install facexlib")
-
         work_model = model.clone()
-        
+
         device = comfy.model_management.get_torch_device()
         dtype = comfy.model_management.unet_dtype()
         if dtype not in [torch.float32, torch.float16, torch.bfloat16]:
@@ -360,59 +379,73 @@ class ApplyPulid:
             num_zero = 0
             ortho = False
             ortho_v2 = False
-        
+
         if fidelity is not None:
             num_zero = fidelity
 
         image = tensor_to_image(image)
 
-        face_helper = FaceRestoreHelper(
-            upscale_factor=1,
-            face_size=512,
-            crop_ratio=(1, 1),
-            det_model='retinaface_resnet50',
-            save_ext='png',
-            device=device,
-        )
+        # Init facexlib helper once if available — lazy, only for explicit face parsing
+        if FACEXLIB_AVAILABLE:
+            face_helper = FaceRestoreHelper(
+                upscale_factor=1,
+                face_size=512,
+                crop_ratio=(1, 1),
+                det_model='retinaface_resnet50',
+                save_ext='png',
+                device=device,
+            )
+            face_helper.face_parse = None
+            face_helper.face_parse = init_parsing_model(model_name='bisenet', device=device)
+            bg_label = [0, 16, 18, 7, 8, 9, 14, 15]
 
-        face_helper.face_parse = None
-        face_helper.face_parse = init_parsing_model(model_name='bisenet', device=device)
-
-        bg_label = [0, 16, 18, 7, 8, 9, 14, 15]
         cond = []
         uncond = []
 
         for i in range(image.shape[0]):
             iface_embeds = None
-            for size in [(size, size) for size in range(640, 256, -64)]:
-                face_analysis.det_model.input_size = size
-                face = face_analysis.get(image[i])
-                if face:
-                    face = sorted(face, key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]))[-1]
-                    iface_embeds = torch.from_numpy(face.embedding).unsqueeze(0).to(device, dtype=dtype)
+            detected_face = None
+            for det_size in [(s, s) for s in range(640, 256, -64)]:
+                face_analysis.det_model.input_size = det_size
+                faces = face_analysis.get(image[i])
+                if faces:
+                    detected_face = sorted(faces, key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]))[-1]
+                    iface_embeds = torch.from_numpy(detected_face.embedding).unsqueeze(0).to(device, dtype=dtype)
                     break
-            else:
+
+            if detected_face is None:
                 print('Warning: No face detected in image', i)
                 continue
 
-            face_helper.clean_all()
-            face_helper.read_image(image[i])
-            face_helper.get_face_landmarks_5(only_center_face=True)
-            face_helper.align_warp_face()
+            if FACEXLIB_AVAILABLE:
+                face_helper.clean_all()
+                face_helper.read_image(image[i])
+                face_helper.get_face_landmarks_5(only_center_face=True)
+                face_helper.align_warp_face()
 
-            if len(face_helper.cropped_faces) == 0:
-                continue
-            
-            face = face_helper.cropped_faces[0]
-            face = image_to_tensor(face).unsqueeze(0).permute(0,3,1,2).to(device)
-            parsing_out = face_helper.face_parse(T.functional.normalize(face, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]))[0]
-            parsing_out = parsing_out.argmax(dim=1, keepdim=True)
-            bg = sum(parsing_out == i for i in bg_label).bool()
-            white_image = torch.ones_like(face)
-            face_features_image = torch.where(bg, white_image, to_gray(face))
-            face_features_image = T.functional.resize(face_features_image, eva_clip.image_size, T.InterpolationMode.BICUBIC if 'cuda' in device.type else T.InterpolationMode.NEAREST).to(device, dtype=dtype)
+                if len(face_helper.cropped_faces) == 0:
+                    continue
+
+                face_crop = face_helper.cropped_faces[0]
+                face_t = image_to_tensor(face_crop).unsqueeze(0).permute(0, 3, 1, 2).to(device)
+                parsing_out = face_helper.face_parse(
+                    T.functional.normalize(face_t, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+                )[0]
+                parsing_out = parsing_out.argmax(dim=1, keepdim=True)
+                bg = sum(parsing_out == label for label in bg_label).bool()
+                white_image = torch.ones_like(face_t)
+                face_features_image = torch.where(bg, white_image, to_gray(face_t))
+            else:
+                # Fallback: affine-align via InsightFace keypoints, no background removal
+                face_crop = _align_face_no_facexlib(image[i], detected_face)
+                face_features_image = image_to_tensor(face_crop).unsqueeze(0).permute(0, 3, 1, 2).to(device)
+
+            face_features_image = T.functional.resize(
+                face_features_image, eva_clip.image_size,
+                T.InterpolationMode.BICUBIC if 'cuda' in device.type else T.InterpolationMode.NEAREST
+            ).to(device, dtype=dtype)
             face_features_image = T.functional.normalize(face_features_image, eva_clip.image_mean, eva_clip.image_std)
-            
+
             id_cond_vit, id_vit_hidden = eva_clip(face_features_image, return_all_features=False, return_hidden=True, shuffle=False)
             id_cond_vit = id_cond_vit.to(device, dtype=dtype)
             for idx in range(len(id_vit_hidden)):
@@ -431,14 +464,14 @@ class ApplyPulid:
                     id_vit_hidden_uncond.append(torch.zeros_like(id_vit_hidden[idx]))
                 else:
                     id_vit_hidden_uncond.append(torch.rand_like(id_vit_hidden[idx]) * noise)
-            
+
             cond.append(pulid_model.get_image_embeds(id_cond, id_vit_hidden))
             uncond.append(pulid_model.get_image_embeds(id_uncond, id_vit_hidden_uncond))
 
         if not cond:
             print("pulid warning: No faces detected in any of the given images, returning unmodified model.")
             return (work_model,)
-        
+
         cond = torch.cat(cond).to(device, dtype=dtype)
         uncond = torch.cat(uncond).to(device, dtype=dtype)
         if cond.shape[0] > 1:
