@@ -27,8 +27,9 @@ INSIGHTFACE_DIR = os.path.join(folder_paths.models_dir, "insightface")
 MODELS_DIR = os.path.join(folder_paths.models_dir, "pulid")
 os.makedirs(MODELS_DIR, exist_ok=True)
 # Only register .safetensors — prevents ComfyUI from scanning .pt files (EVA-CLIP OOM)
-# Do NOT add checkpoints/ paths (would trigger IPAdapter to load pulid model as checkpoint)
-folder_paths.folder_names_and_paths["pulid"] = ([MODELS_DIR], {'.safetensors'})
+# Also search loras/ so the model can be placed there during before_start (pulid/ doesn't exist yet then)
+_loras_dirs = folder_paths.folder_names_and_paths.get("loras", ([],))[0]
+folder_paths.folder_names_and_paths["pulid"] = ([MODELS_DIR] + list(_loras_dirs), {'.safetensors'})
 
 
 class PulidModel(nn.Module):
