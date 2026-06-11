@@ -4,7 +4,6 @@ import torchvision.transforms as T
 import torch.nn.functional as F
 import os
 import math
-import cv2
 import numpy as np
 import folder_paths
 import comfy.utils
@@ -201,6 +200,7 @@ _ARCFACE_DST = np.array([
 
 def _align_face_no_facexlib(image_np, face_obj, size=512):
     """Align face via InsightFace keypoints — fallback when facexlib unavailable."""
+    import cv2
     kps = face_obj.kps.astype(np.float32)
     scale = size / 112.0
     dst = _ARCFACE_DST * scale
